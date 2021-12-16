@@ -17,6 +17,8 @@ struct virtio_pci_modern_device {
 	resource_size_t notify_pa;
 	/* Where to read and clear interrupt */
 	u8 __iomem *isr;
+        /* PASID cfg */
+        struct virtio_pci_pasid_cfg __iomem *pasid;
 
 	/* So we can sanity-check accesses. */
 	size_t notify_len;
@@ -104,6 +106,8 @@ u16 vp_modern_get_queue_size(struct virtio_pci_modern_device *mdev,
 u16 vp_modern_get_num_queues(struct virtio_pci_modern_device *mdev);
 void __iomem * vp_modern_map_vq_notify(struct virtio_pci_modern_device *mdev,
 				       u16 index, resource_size_t *pa);
+void vp_modern_set_group_pasid(struct virtio_pci_modern_device *mdev,
+                               u16 index, int pasid);
 int vp_modern_probe(struct virtio_pci_modern_device *mdev);
 void vp_modern_remove(struct virtio_pci_modern_device *mdev);
 #endif

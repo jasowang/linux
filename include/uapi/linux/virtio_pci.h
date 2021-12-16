@@ -98,6 +98,8 @@
 #define VIRTIO_PCI_ISR_CONFIG		0x2
 /* Vector value used to disable MSI for queue */
 #define VIRTIO_MSI_NO_VECTOR            0xffff
+/* ID value used to disable PASID for queue */
+#define VIRTIO_PASID_NO_ID              0xffffffff
 
 #ifndef VIRTIO_PCI_NO_MODERN
 
@@ -116,6 +118,9 @@
 /* Additional shared memory capability */
 #define VIRTIO_PCI_CAP_SHARED_MEMORY_CFG 8
 
+/* PASID configuration */
+#define VIRTIO_PCI_ECAP_PASID_CFG        1
+
 /* This is the PCI capability header: */
 struct virtio_pci_cap {
 	__u8 cap_vndr;		/* Generic PCI field: PCI_CAP_ID_VNDR */
@@ -128,6 +133,22 @@ struct virtio_pci_cap {
 	__le32 offset;		/* Offset within bar. */
 	__le32 length;		/* Length of the structure, in bytes. */
 };
+
+/* This is the PCIe capability header: */
+struct virtio_pci_ecap {
+        __le16 cap_vndr;      /* Generic PCIe field: PCI_EXT_CAP_ID_VNDR */
+        __le16 cap_rev:4;     /* Generic PCIe field: capability version: 0x1 */
+        __le16 cap_next:12;   /* Generic PCIe field: next ptr. */
+        __le16 cfg_type;      /* Identifies the structure. */
+        __le16 cfg_rev:4;     /* Identifies the version of the structure. */
+        __le16 cap_len:12;    /* The bytes of the entire VSEC */
+        __u8 bar;             /* Where to find it. */
+        __u8 id;              /* Multiple capabilities of the same type */
+        __u8 padding[2];      /* Pad to full qword. */
+        __le32 offset;        /* Offset within bar. */
+        __le32 length;        /* Length of the structure, in bytes. */
+};
+
 
 struct virtio_pci_cap64 {
 	struct virtio_pci_cap cap;
@@ -172,6 +193,16 @@ struct virtio_pci_cfg_cap {
 	__u8 pci_cfg_data[4]; /* Data for BAR access. */
 };
 
+struct virtio_pci_pasid_cfg {
+        /* About a specific virtqueue. */
+        __le16 queue_select;
+        __le16 group_id;
+        __le16 reserved;
+        /* About a specific virtqueue group. */
+        __le16 group_select;
+        __le32 group_pasid;
+};
+
 /* Macro versions of offsets for the Old Timers! */
 #define VIRTIO_PCI_CAP_VNDR		0
 #define VIRTIO_PCI_CAP_NEXT		1
@@ -202,6 +233,11 @@ struct virtio_pci_cfg_cap {
 #define VIRTIO_PCI_COMMON_Q_AVAILHI	44
 #define VIRTIO_PCI_COMMON_Q_USEDLO	48
 #define VIRTIO_PCI_COMMON_Q_USEDHI	52
+
+#define VIRTIO_PCI_PASID_Q_SELECT    0
+#define VIRTIO_PCI_PASID_Q_GROUP_ID  2
+#define VIRTIO_PCI_PASID_G_SELECT    6
+#define VIRTIO_PCI_PASID_G_PASID     8
 
 #endif /* VIRTIO_PCI_NO_MODERN */
 

@@ -14,26 +14,34 @@
  * @size: map size
  * @len: the length that is actually mapped
  * @pa: physical address of the capability
+ * @ext: whether or not it's PCIe extended capability
  *
  * Returns the io address of for the part of the capability
  */
 static void __iomem *
 vp_modern_map_capability(struct virtio_pci_modern_device *mdev, int off,
 			 size_t minlen, u32 align, u32 start, u32 size,
-			 size_t *len, resource_size_t *pa)
+			 size_t *len, resource_size_t *pa, bool ext)
 {
 	struct pci_dev *dev = mdev->pci_dev;
 	u8 bar;
 	u32 offset, length;
 	void __iomem *p;
+	int off_bar, off_off, off_len;
 
-	pci_read_config_byte(dev, off + offsetof(struct virtio_pci_cap,
-						 bar),
-			     &bar);
-	pci_read_config_dword(dev, off + offsetof(struct virtio_pci_cap, offset),
-			     &offset);
-	pci_read_config_dword(dev, off + offsetof(struct virtio_pci_cap, length),
-			      &length);
+	if (ext) {
+		off_bar = offsetof(struct virtio_pci_ecap, bar);
+		off_off = offsetof(struct virtio_pci_ecap, offset);
+		off_len = offsetof(struct virtio_pci_ecap, length);
+	} else {
+		off_bar = offsetof(struct virtio_pci_cap, bar);
+		off_off = offsetof(struct virtio_pci_cap, offset);
+		off_len = offsetof(struct virtio_pci_cap, length);
+	}
+
+	pci_read_config_byte(dev, off + off_bar, &bar);
+	pci_read_config_dword(dev, off + off_off, &offset);
+	pci_read_config_dword(dev, off + off_len, &length);
 
 	if (length <= start) {
 		dev_err(&dev->dev,
@@ -106,7 +114,7 @@ vp_modern_map_capability(struct virtio_pci_modern_device *mdev, int off,
 static inline int virtio_pci_find_capability(struct pci_dev *dev, u8 cfg_type,
 					     u32 ioresource_types, int *bars)
 {
-	int pos;
+	int pos = 0;
 
 	for (pos = pci_find_capability(dev, PCI_CAP_ID_VNDR);
 	     pos > 0;
@@ -131,6 +139,46 @@ static inline int virtio_pci_find_capability(struct pci_dev *dev, u8 cfg_type,
 			}
 		}
 	}
+
+	return 0;
+}
+
+/**
+ * virtio_pci_find_ext_capability - walk capabilities to find device info.
+ * @dev: the pci device
+ * @cfg_type: the VIRTIO_PCI_CAP_* value we seek
+ * @bars: the bitmask of BARs
+ *
+ * Returns offset of the capability, or 0.
+ */
+static inline int virtio_pci_find_ext_capability(struct pci_dev *dev, u16 cfg_type,
+						 int *bars)
+{
+	int pos = 0;
+
+	for (pos = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_VNDR);
+	     pos > 0;
+	     pos = pci_find_next_ext_capability(dev, pos, PCI_EXT_CAP_ID_VNDR)) {
+		u16 type;
+		u8 bar;
+		pci_read_config_word(dev, pos + offsetof(struct virtio_pci_ecap,
+							 cfg_id), &type);
+		pci_read_config_byte(dev, pos + offsetof(struct virtio_pci_ecap,
+							 bar), &bar);
+
+		/* Ignore structures with reserved BAR values */
+		if (bar > 0x5)
+			continue;
+
+		if (type == cfg_type) {
+			if (pci_resource_len(dev, bar) &&
+			    pci_resource_flags(dev, bar) & IORESOURCE_MEM) {
+				*bars |= (1 << bar);
+				return pos;
+			}
+		}
+	}
+
 	return 0;
 }
 
@@ -207,7 +255,7 @@ static inline void check_offsets(void)
 int vp_modern_probe(struct virtio_pci_modern_device *mdev)
 {
 	struct pci_dev *pci_dev = mdev->pci_dev;
-	int err, common, isr, notify, device;
+	int err, common, isr, notify, device, pasid;
 	u32 notify_length;
 	u32 notify_offset;
 
@@ -268,6 +316,13 @@ int vp_modern_probe(struct virtio_pci_modern_device *mdev)
 					    IORESOURCE_IO | IORESOURCE_MEM,
 					    &mdev->modern_bars);
 
+	pasid = virtio_pci_find_ext_capability(pci_dev,
+					       VIRTIO_PCI_ECAP_PASID_CFG,
+					       &mdev->modern_bars);
+	if (pasid) {
+		printk("Find PASID capability!\n");
+	}
+
 	err = pci_request_selected_regions(pci_dev, mdev->modern_bars,
 					   "virtio-pci-modern");
 	if (err)
@@ -277,12 +332,11 @@ int vp_modern_probe(struct virtio_pci_modern_device *mdev)
 	mdev->common = vp_modern_map_capability(mdev, common,
 				      sizeof(struct virtio_pci_common_cfg), 4,
 				      0, sizeof(struct virtio_pci_common_cfg),
-				      NULL, NULL);
+				      NULL, NULL, false);
 	if (!mdev->common)
 		goto err_map_common;
 	mdev->isr = vp_modern_map_capability(mdev, isr, sizeof(u8), 1,
-					     0, 1,
-					     NULL, NULL);
+					     0, 1, NULL, NULL, false);
 	if (!mdev->isr)
 		goto err_map_isr;
 
@@ -311,7 +365,8 @@ int vp_modern_probe(struct virtio_pci_modern_device *mdev)
 							     2, 2,
 							     0, notify_length,
 							     &mdev->notify_len,
-							     &mdev->notify_pa);
+							     &mdev->notify_pa,
+							     false);
 		if (!mdev->notify_base)
 			goto err_map_notify;
 	} else {
@@ -325,9 +380,22 @@ int vp_modern_probe(struct virtio_pci_modern_device *mdev)
 		mdev->device = vp_modern_map_capability(mdev, device, 0, 4,
 							0, PAGE_SIZE,
 							&mdev->device_len,
-							NULL);
+							NULL, false);
 		if (!mdev->device)
 			goto err_map_device;
+	}
+
+	if (pasid) {
+		mdev->pasid = vp_modern_map_capability(mdev, pasid,
+				      sizeof(struct virtio_pci_pasid_cfg), 4,
+				      0, sizeof(struct virtio_pci_pasid_cfg),
+				      NULL, NULL, true);
+		if (!mdev->pasid)
+			printk("pasid map error!\n");
+		else {
+			vp_iowrite16(1, &mdev->pasid->queue_select);
+			vp_modern_set_group_pasid(mdev, 0, 1);
+		}
 	}
 
 	return 0;
@@ -618,6 +686,24 @@ static u16 vp_modern_get_queue_notify_off(struct virtio_pci_modern_device *mdev,
 }
 
 /*
+ * vp_modern_set_group_pasid - set PASID for a specific virtqueue group
+ * @mdev: the modern virtio-pci device
+ * @index: the groupe index
+ * @pasid: the PASID to be assocaited to the group
+ *
+ * Returns the notification offset for a virtqueue
+ */
+void vp_modern_set_group_pasid(struct virtio_pci_modern_device *mdev,
+			       u16 index, int pasid)
+{
+	struct virtio_pci_pasid_cfg *cfg = mdev->pasid;
+
+	vp_iowrite16(index, &cfg->group_select);
+	vp_iowrite32(pasid, &cfg->group_pasid);
+}
+EXPORT_SYMBOL_GPL(vp_modern_set_group_pasid);
+
+/*
  * vp_modern_map_vq_notify - map notification area for a
  * specific virtqueue
  * @mdev: the modern virtio-pci device
@@ -650,7 +736,7 @@ void __iomem *vp_modern_map_vq_notify(struct virtio_pci_modern_device *mdev,
 		return vp_modern_map_capability(mdev,
 				       mdev->notify_map_cap, 2, 2,
 				       off * mdev->notify_offset_multiplier, 2,
-				       NULL, pa);
+				       NULL, pa, false);
 	}
 }
 EXPORT_SYMBOL_GPL(vp_modern_map_vq_notify);
