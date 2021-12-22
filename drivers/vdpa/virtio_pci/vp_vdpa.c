@@ -414,6 +414,14 @@ vp_vdpa_get_vq_notification(struct vdpa_device *vdpa, u16 qid)
 	return notify;
 }
 
+struct device *vp_vdpa_get_vq_dma_dev(struct vdpa_device *vdpa, u16 qid)
+{
+	struct vp_vdpa *vp_vdpa = vdpa_to_vp(vdpa);
+	struct virtio_pci_modern_device *mdev = &vp_vdpa->mdev;
+
+	return &mdev->pci_dev->dev;
+}
+
 static const struct vdpa_config_ops vp_vdpa_ops = {
 	.get_features	= vp_vdpa_get_features,
 	.set_features	= vp_vdpa_set_features,
@@ -439,6 +447,7 @@ static const struct vdpa_config_ops vp_vdpa_ops = {
 	.set_config	= vp_vdpa_set_config,
 	.set_config_cb  = vp_vdpa_set_config_cb,
 	.get_vq_irq	= vp_vdpa_get_vq_irq,
+	.get_vq_dma_dev = vp_vdpa_get_vq_dma_dev,
 };
 
 static void vp_vdpa_free_irq_vectors(void *data)
