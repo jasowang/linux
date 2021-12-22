@@ -253,6 +253,11 @@ struct vdpa_map_file {
  *				@iova: iova to be unmapped
  *				@size: size of the area
  *				Returns integer: success (0) or error (< 0)
+ * @get_vq_dma_dev:		Get the dma device for a specific
+ *				virtqueue (optional)
+ *				@vdev: vdpa device
+ *				@idx: virtqueue index
+ *				Returns pointer to structure device or error (NULL)
  * @free:			Free resources that belongs to vDPA (optional)
  *				@vdev: vdpa device
  */
@@ -302,6 +307,7 @@ struct vdpa_config_ops {
 	int (*dma_map)(struct vdpa_device *vdev, u64 iova, u64 size,
 		       u64 pa, u32 perm, void *opaque);
 	int (*dma_unmap)(struct vdpa_device *vdev, u64 iova, u64 size);
+	struct device *(*get_vq_dma_dev)(struct vdpa_device *vdev, u16 idx);
 
 	/* Free device resources */
 	void (*free)(struct vdpa_device *vdev);
