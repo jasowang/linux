@@ -196,6 +196,8 @@ struct vring_virtqueue {
 	bool last_add_time_valid;
 	ktime_t last_add_time;
 #endif
+
+	struct device *dma_dev;
 };
 
 
@@ -275,11 +277,11 @@ size_t virtio_max_dma_size(struct virtio_device *vdev)
 EXPORT_SYMBOL_GPL(virtio_max_dma_size);
 
 static void *vring_alloc_queue(struct virtio_device *vdev, size_t size,
-			      dma_addr_t *dma_handle, gfp_t flag)
+			       dma_addr_t *dma_handle, gfp_t flag,
+			       struct device *dma_dev)
 {
 	if (vring_use_dma_api(vdev)) {
-		return dma_alloc_coherent(vdev->dev.parent, size,
-					  dma_handle, flag);
+		return dma_alloc_coherent(dma_dev, size, dma_handle, flag);
 	} else {
 		void *queue = alloc_pages_exact(PAGE_ALIGN(size), flag);
 
@@ -308,10 +310,11 @@ static void *vring_alloc_queue(struct virtio_device *vdev, size_t size,
 }
 
 static void vring_free_queue(struct virtio_device *vdev, size_t size,
-			     void *queue, dma_addr_t dma_handle)
+			     void *queue, dma_addr_t dma_handle,
+			     struct device *dma_dev)
 {
 	if (vring_use_dma_api(vdev))
-		dma_free_coherent(vdev->dev.parent, size, queue, dma_handle);
+		dma_free_coherent(dma_dev, size, queue, dma_handle);
 	else
 		free_pages_exact(queue, PAGE_ALIGN(size));
 }
@@ -323,6 +326,9 @@ static void vring_free_queue(struct virtio_device *vdev, size_t size,
  */
 static inline struct device *vring_dma_dev(const struct vring_virtqueue *vq)
 {
+	if (vq->dma_dev)
+		return vq->dma_dev;
+
 	return vq->vq.vdev->dev.parent;
 }
 
@@ -925,13 +931,17 @@ static struct virtqueue *vring_create_virtqueue_split(
 	bool context,
 	bool (*notify)(struct virtqueue *),
 	void (*callback)(struct virtqueue *),
-	const char *name)
+	const char *name,
+	struct device *dma_dev)
 {
 	struct virtqueue *vq;
 	void *queue = NULL;
 	dma_addr_t dma_addr;
 	size_t queue_size_in_bytes;
 	struct vring vring;
+
+	if (!dma_dev)
+		dma_dev = vdev->dev.parent;
 
 	/* We assume num is a power of 2. */
 	if (num & (num - 1)) {
@@ -943,7 +953,8 @@ static struct virtqueue *vring_create_virtqueue_split(
 	for (; num && vring_size(num, vring_align) > PAGE_SIZE; num /= 2) {
 		queue = vring_alloc_queue(vdev, vring_size(num, vring_align),
 					  &dma_addr,
-					  GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO);
+					  GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO,
+					  dma_dev);
 		if (queue)
 			break;
 		if (!may_reduce_num)
@@ -956,7 +967,8 @@ static struct virtqueue *vring_create_virtqueue_split(
 	if (!queue) {
 		/* Try to get a single page. You are my only hope! */
 		queue = vring_alloc_queue(vdev, vring_size(num, vring_align),
-					  &dma_addr, GFP_KERNEL|__GFP_ZERO);
+					  &dma_addr, GFP_KERNEL|__GFP_ZERO,
+					  dma_dev);
 	}
 	if (!queue)
 		return NULL;
@@ -965,10 +977,10 @@ static struct virtqueue *vring_create_virtqueue_split(
 	vring_init(&vring, num, queue, vring_align);
 
 	vq = __vring_new_virtqueue(index, vring, vdev, weak_barriers, context,
-				   notify, callback, name);
+				   notify, callback, name, dma_dev);
 	if (!vq) {
 		vring_free_queue(vdev, queue_size_in_bytes, queue,
-				 dma_addr);
+				 dma_addr, dma_dev);
 		return NULL;
 	}
 
@@ -1663,7 +1675,8 @@ static struct virtqueue *vring_create_virtqueue_packed(
 	bool context,
 	bool (*notify)(struct virtqueue *),
 	void (*callback)(struct virtqueue *),
-	const char *name)
+	const char *name,
+	struct device *dma_dev)
 {
 	struct vring_virtqueue *vq;
 	struct vring_packed_desc *ring;
@@ -1671,11 +1684,15 @@ static struct virtqueue *vring_create_virtqueue_packed(
 	dma_addr_t ring_dma_addr, driver_event_dma_addr, device_event_dma_addr;
 	size_t ring_size_in_bytes, event_size_in_bytes;
 
+	if (!dma_dev)
+		dma_dev = vdev->dev.parent;
+
 	ring_size_in_bytes = num * sizeof(struct vring_packed_desc);
 
 	ring = vring_alloc_queue(vdev, ring_size_in_bytes,
 				 &ring_dma_addr,
-				 GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO);
+				 GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO,
+				 dma_dev);
 	if (!ring)
 		goto err_ring;
 
@@ -1683,13 +1700,15 @@ static struct virtqueue *vring_create_virtqueue_packed(
 
 	driver = vring_alloc_queue(vdev, event_size_in_bytes,
 				   &driver_event_dma_addr,
-				   GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO);
+				   GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO,
+				   dma_dev);
 	if (!driver)
 		goto err_driver;
 
 	device = vring_alloc_queue(vdev, event_size_in_bytes,
 				   &device_event_dma_addr,
-				   GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO);
+				   GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO,
+				   dma_dev);
 	if (!device)
 		goto err_device;
 
@@ -1711,6 +1730,7 @@ static struct virtqueue *vring_create_virtqueue_packed(
 	vq->num_added = 0;
 	vq->packed_ring = true;
 	vq->use_dma_api = vring_use_dma_api(vdev);
+	vq->dma_dev= dma_dev;
 #ifdef DEBUG
 	vq->in_use = false;
 	vq->last_add_time_valid = false;
@@ -1774,11 +1794,14 @@ err_desc_extra:
 err_desc_state:
 	kfree(vq);
 err_vq:
-	vring_free_queue(vdev, event_size_in_bytes, device, device_event_dma_addr);
+	vring_free_queue(vdev, event_size_in_bytes, device,
+			 device_event_dma_addr, dma_dev);
 err_device:
-	vring_free_queue(vdev, event_size_in_bytes, driver, driver_event_dma_addr);
+	vring_free_queue(vdev, event_size_in_bytes, driver,
+			 driver_event_dma_addr, dma_dev);
 err_driver:
-	vring_free_queue(vdev, ring_size_in_bytes, ring, ring_dma_addr);
+	vring_free_queue(vdev, ring_size_in_bytes, ring,
+			 ring_dma_addr, dma_dev);
 err_ring:
 	return NULL;
 }
@@ -2174,7 +2197,8 @@ struct virtqueue *__vring_new_virtqueue(unsigned int index,
 					bool context,
 					bool (*notify)(struct virtqueue *),
 					void (*callback)(struct virtqueue *),
-					const char *name)
+					const char *name,
+					struct device *dma_dev)
 {
 	struct vring_virtqueue *vq;
 
@@ -2199,6 +2223,7 @@ struct virtqueue *__vring_new_virtqueue(unsigned int index,
 	vq->event_triggered = false;
 	vq->num_added = 0;
 	vq->use_dma_api = vring_use_dma_api(vdev);
+	vq->dma_dev = dma_dev;
 #ifdef DEBUG
 	vq->in_use = false;
 	vq->last_add_time_valid = false;
@@ -2253,6 +2278,31 @@ err_state:
 }
 EXPORT_SYMBOL_GPL(__vring_new_virtqueue);
 
+struct virtqueue *vring_create_virtqueue_dma(
+	unsigned int index,
+	unsigned int num,
+	unsigned int vring_align,
+	struct virtio_device *vdev,
+	bool weak_barriers,
+	bool may_reduce_num,
+	bool context,
+	bool (*notify)(struct virtqueue *),
+	void (*callback)(struct virtqueue *),
+	const char *name,
+	struct device *dma_dev)
+{
+
+	if (virtio_has_feature(vdev, VIRTIO_F_RING_PACKED))
+		return vring_create_virtqueue_packed(index, num, vring_align,
+				vdev, weak_barriers, may_reduce_num,
+				context, notify, callback, name, dma_dev);
+
+	return vring_create_virtqueue_split(index, num, vring_align,
+			vdev, weak_barriers, may_reduce_num,
+			context, notify, callback, name, dma_dev);
+}
+EXPORT_SYMBOL_GPL(vring_create_virtqueue_dma);
+
 struct virtqueue *vring_create_virtqueue(
 	unsigned int index,
 	unsigned int num,
@@ -2265,15 +2315,10 @@ struct virtqueue *vring_create_virtqueue(
 	void (*callback)(struct virtqueue *),
 	const char *name)
 {
-
-	if (virtio_has_feature(vdev, VIRTIO_F_RING_PACKED))
-		return vring_create_virtqueue_packed(index, num, vring_align,
-				vdev, weak_barriers, may_reduce_num,
-				context, notify, callback, name);
-
-	return vring_create_virtqueue_split(index, num, vring_align,
-			vdev, weak_barriers, may_reduce_num,
-			context, notify, callback, name);
+	return vring_create_virtqueue_dma(index, num, vring_align, vdev,
+					  weak_barriers, may_reduce_num,
+					  context, notify, callback,
+					  name, NULL);
 }
 EXPORT_SYMBOL_GPL(vring_create_virtqueue);
 
@@ -2296,7 +2341,7 @@ struct virtqueue *vring_new_virtqueue(unsigned int index,
 
 	vring_init(&vring, num, pages, vring_align);
 	return __vring_new_virtqueue(index, vring, vdev, weak_barriers, context,
-				     notify, callback, name);
+				     notify, callback, name, vdev->dev.parent);
 }
 EXPORT_SYMBOL_GPL(vring_new_virtqueue);
 
@@ -2313,17 +2358,20 @@ void vring_del_virtqueue(struct virtqueue *_vq)
 			vring_free_queue(vq->vq.vdev,
 					 vq->packed.ring_size_in_bytes,
 					 vq->packed.vring.desc,
-					 vq->packed.ring_dma_addr);
+					 vq->packed.ring_dma_addr,
+					 vq->dma_dev);
 
 			vring_free_queue(vq->vq.vdev,
 					 vq->packed.event_size_in_bytes,
 					 vq->packed.vring.driver,
-					 vq->packed.driver_event_dma_addr);
+					 vq->packed.driver_event_dma_addr,
+					 vq->dma_dev);
 
 			vring_free_queue(vq->vq.vdev,
 					 vq->packed.event_size_in_bytes,
 					 vq->packed.vring.device,
-					 vq->packed.device_event_dma_addr);
+					 vq->packed.device_event_dma_addr,
+					 vq->dma_dev);
 
 			kfree(vq->packed.desc_state);
 			kfree(vq->packed.desc_extra);
@@ -2331,7 +2379,8 @@ void vring_del_virtqueue(struct virtqueue *_vq)
 			vring_free_queue(vq->vq.vdev,
 					 vq->split.queue_size_in_bytes,
 					 vq->split.vring.desc,
-					 vq->split.queue_dma_addr);
+					 vq->split.queue_dma_addr,
+					 vq->dma_dev);
 		}
 	}
 	if (!vq->packed_ring) {
