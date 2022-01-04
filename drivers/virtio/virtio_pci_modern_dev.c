@@ -3,6 +3,8 @@
 #include <linux/virtio_pci_modern.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/pci-ats.h>
+#include <linux/iommu.h>
 
 /*
  * vp_modern_map_capability - map a part of virtio pci capability
@@ -162,7 +164,7 @@ static inline int virtio_pci_find_ext_capability(struct pci_dev *dev, u16 cfg_ty
 		u16 type;
 		u8 bar;
 		pci_read_config_word(dev, pos + offsetof(struct virtio_pci_ecap,
-							 cfg_id), &type);
+							 cfg_type), &type);
 		pci_read_config_byte(dev, pos + offsetof(struct virtio_pci_ecap,
 							 bar), &bar);
 
@@ -390,11 +392,9 @@ int vp_modern_probe(struct virtio_pci_modern_device *mdev)
 				      sizeof(struct virtio_pci_pasid_cfg), 4,
 				      0, sizeof(struct virtio_pci_pasid_cfg),
 				      NULL, NULL, true);
-		if (!mdev->pasid)
+		if (!mdev->pasid) {
 			printk("pasid map error!\n");
-		else {
-			vp_iowrite16(1, &mdev->pasid->queue_select);
-			vp_modern_set_group_pasid(mdev, 0, 1);
+			goto err_map_device;
 		}
 	}
 

@@ -194,10 +194,11 @@ struct virtio_pci_cfg_cap {
 };
 
 struct virtio_pci_pasid_cfg {
+        /* About the whole device */
+        uint16_t groups;
         /* About a specific virtqueue. */
         __le16 queue_select;
         __le16 group_id;
-        __le16 reserved;
         /* About a specific virtqueue group. */
         __le16 group_select;
         __le32 group_pasid;
@@ -234,8 +235,9 @@ struct virtio_pci_pasid_cfg {
 #define VIRTIO_PCI_COMMON_Q_USEDLO	48
 #define VIRTIO_PCI_COMMON_Q_USEDHI	52
 
-#define VIRTIO_PCI_PASID_Q_SELECT    0
-#define VIRTIO_PCI_PASID_Q_GROUP_ID  2
+#define VIRTIO_PCI_PASID_GROUPS 0
+#define VIRTIO_PCI_PASID_Q_SELECT    2
+#define VIRTIO_PCI_PASID_Q_GROUP_ID  4
 #define VIRTIO_PCI_PASID_G_SELECT    6
 #define VIRTIO_PCI_PASID_G_PASID     8
 

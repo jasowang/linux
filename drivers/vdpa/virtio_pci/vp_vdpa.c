@@ -17,6 +17,10 @@
 #include <linux/virtio_ring.h>
 #include <linux/virtio_pci.h>
 #include <linux/virtio_pci_modern.h>
+#include <linux/pci-ats.h>
+#include <linux/iommu.h>
+#include <linux/dma-map-ops.h>
+#include <linux/iova.h>
 
 #define VP_VDPA_QUEUE_MAX 256
 #define VP_VDPA_DRIVER_NAME "vp_vdpa"
@@ -35,6 +39,8 @@ struct vp_vdpa {
 	struct virtio_pci_modern_device mdev;
 	struct vp_vring *vring;
 	struct vdpa_callback config_cb;
+	struct iommu_domain *domain;
+	struct iova_domain iova;
 	char msix_name[VP_VDPA_NAME_SIZE];
 	int config_irq;
 	int queues;
@@ -192,11 +198,17 @@ static void vp_vdpa_set_status(struct vdpa_device *vdpa, u8 status)
 {
 	struct vp_vdpa *vp_vdpa = vdpa_to_vp(vdpa);
 	struct virtio_pci_modern_device *mdev = &vp_vdpa->mdev;
+	struct pci_dev *pdev = mdev->pci_dev;
 	u8 s = vp_vdpa_get_status(vdpa);
 
 	if (status & VIRTIO_CONFIG_S_DRIVER_OK &&
 	    !(s & VIRTIO_CONFIG_S_DRIVER_OK)) {
 		vp_vdpa_request_irq(vp_vdpa);
+		if (mdev->pasid) {
+			vp_modern_set_group_pasid(mdev, 1,
+			iommu_aux_get_pasid(vp_vdpa->domain,
+					    &pdev->dev));
+		}
 	}
 
 	vp_modern_set_status(mdev, status);
@@ -419,8 +431,141 @@ struct device *vp_vdpa_get_vq_dma_dev(struct vdpa_device *vdpa, u16 qid)
 	struct vp_vdpa *vp_vdpa = vdpa_to_vp(vdpa);
 	struct virtio_pci_modern_device *mdev = &vp_vdpa->mdev;
 
+	if (qid == 1)
+		return &vp_vdpa->vdpa.dev;
+
 	return &mdev->pci_dev->dev;
 }
+
+/**
+ * dma_info_to_prot - Translate DMA API directions and attributes to IOMMU API
+ *                    page flags.
+ * @dir: Direction of DMA transfer
+ * @coherent: Is the DMA master cache-coherent?
+ * @attrs: DMA attributes for the mapping
+ *
+ * Return: corresponding IOMMU API page protection flags
+ */
+static int dma_info_to_prot(enum dma_data_direction dir, bool coherent,
+		     unsigned long attrs)
+{
+	int prot = coherent ? IOMMU_CACHE : 0;
+
+	if (attrs & DMA_ATTR_PRIVILEGED)
+		prot |= IOMMU_PRIV;
+
+	switch (dir) {
+	case DMA_BIDIRECTIONAL:
+		return prot | IOMMU_READ | IOMMU_WRITE;
+	case DMA_TO_DEVICE:
+		return prot | IOMMU_READ;
+	case DMA_FROM_DEVICE:
+		return prot | IOMMU_WRITE;
+	default:
+		return 0;
+	}
+}
+
+#define IOVA_LIMIT ((1ULL << 39) - 1)
+
+static dma_addr_t vp_vdpa_map_page(struct device *dev, struct page *page,
+				   unsigned long offset, size_t size,
+				   enum dma_data_direction dir,
+				   unsigned long attrs)
+{
+	phys_addr_t phys = page_to_phys(page);
+	struct vdpa_device *vdpa = dev_to_vdpa(dev);
+	struct vp_vdpa *vp_vdpa = vdpa_to_vp(vdpa);
+	struct iommu_domain *domain = vp_vdpa->domain;
+	struct iova_domain *iovad = &vp_vdpa->iova;
+	struct virtio_pci_modern_device *mdev = &vp_vdpa->mdev;
+	struct pci_dev *pdev = mdev->pci_dev;
+	bool coherent = dev_is_dma_coherent(&pdev->dev);
+	int prot = dma_info_to_prot(dir, coherent, attrs);
+	dma_addr_t dma_addr;
+	int ret;
+	unsigned long shift = iova_shift(iovad);
+	unsigned long iova_len, iova;
+
+	size = PAGE_ALIGN(size);
+	iova_len = size >> shift;
+
+	iova = alloc_iova_fast(iovad, iova_len,
+			       DMA_BIT_MASK(32) >> shift,
+			       false);
+	if (!iova)
+		return DMA_MAPPING_ERROR;
+
+	dma_addr = (dma_addr_t)iova << shift;
+
+	ret = iommu_map_atomic(domain, dma_addr, phys, size, prot);
+
+	if (ret)
+		return DMA_MAPPING_ERROR;
+
+	return dma_addr + offset;
+}
+
+static void vp_vdpa_unmap_page(struct device *dev, dma_addr_t dma_addr,
+			       size_t size, enum dma_data_direction dir,
+			       unsigned long attrs)
+{
+	struct vdpa_device *vdpa = dev_to_vdpa(dev);
+	struct vp_vdpa *vp_vdpa = vdpa_to_vp(vdpa);
+	struct iommu_domain *domain = vp_vdpa->domain;
+	struct iova_domain *iovad = &vp_vdpa->iova;
+	size_t iova_off = iova_offset(iovad, dma_addr);
+
+	dma_addr -= iova_off;
+	size = iova_align(iovad, size + iova_off);
+
+	iommu_unmap(domain, dma_addr, size);
+
+	free_iova_fast(iovad, iova_pfn(iovad, dma_addr),
+		       size >> iova_shift(iovad));
+}
+
+static void *vp_vdpa_alloc_coherent(struct device *dev, size_t size,
+				    dma_addr_t *dma_addr, gfp_t gfp,
+				    unsigned long attrs)
+{
+	size_t alloc_size = PAGE_ALIGN(size);
+	int order = get_order(alloc_size);
+	struct page *page;
+
+	page = alloc_pages(gfp, order);
+	if (!page)
+		return NULL;
+
+	*dma_addr = vp_vdpa_map_page(dev, page, 0, alloc_size,
+				     DMA_BIDIRECTIONAL, attrs);
+	if (*dma_addr == DMA_MAPPING_ERROR) {
+		__free_pages(page, order);
+		return NULL;
+	}
+
+	return page_address(page);
+}
+
+static void vp_vdpa_free_coherent(struct device *dev, size_t size,
+				  void *vaddr, dma_addr_t dma_addr,
+				  unsigned long attrs)
+{
+	struct page *page = virt_to_page(vaddr);
+	size_t alloc_size = PAGE_ALIGN(size);
+
+	vp_vdpa_unmap_page(dev, dma_addr, size,
+			   DMA_BIDIRECTIONAL, attrs);
+
+	__free_pages(page, get_order(alloc_size));
+}
+
+static const struct dma_map_ops vp_vdpa_dma_ops = {
+	.map_page = vp_vdpa_map_page,
+	.unmap_page = vp_vdpa_unmap_page,
+	.alloc = vp_vdpa_alloc_coherent,
+	.free = vp_vdpa_free_coherent,
+};
 
 static const struct vdpa_config_ops vp_vdpa_ops = {
 	.get_features	= vp_vdpa_get_features,
@@ -459,6 +604,7 @@ static int vp_vdpa_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct virtio_pci_modern_device *mdev;
 	struct device *dev = &pdev->dev;
+	struct device *dma_dev;
 	struct vp_vdpa *vp_vdpa;
 	int ret, i;
 
@@ -485,7 +631,13 @@ static int vp_vdpa_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	pci_set_master(pdev);
 	pci_set_drvdata(pdev, vp_vdpa);
 
-	vp_vdpa->vdpa.dma_dev = &pdev->dev;
+	dma_dev = &vp_vdpa->vdpa.dev;
+	dma_dev->dma_mask = &dma_dev->coherent_dma_mask;
+	if (dma_set_mask_and_coherent(dma_dev, DMA_BIT_MASK(64)))
+		goto err;
+	set_dma_ops(dma_dev, &vp_vdpa_dma_ops);
+
+	vp_vdpa->vdpa.dma_dev = dma_dev;
 	vp_vdpa->queues = vp_modern_get_num_queues(mdev);
 
 	ret = devm_add_action_or_reset(dev, vp_vdpa_free_irq_vectors, pdev);
@@ -517,6 +669,47 @@ static int vp_vdpa_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 	vp_vdpa->config_irq = VIRTIO_MSI_NO_VECTOR;
 
+	if (mdev->pasid) {
+		struct bus_type *bus = pdev->dev.bus;
+
+		if (!bus) {
+			ret = -EINVAL;
+			goto err;
+		}
+
+		ret = pci_enable_pasid(pdev, 0);
+		if (ret)
+			goto err;
+
+		ret = iommu_dev_enable_feature(&pdev->dev,
+					       IOMMU_DEV_FEAT_AUX);
+		if (ret)
+			goto err;
+
+		vp_vdpa->domain = iommu_domain_alloc(bus);
+		if (!vp_vdpa->domain) {
+			ret = -EFAULT;
+			goto err;
+		}
+
+		ret = iommu_aux_attach_device(vp_vdpa->domain, &pdev->dev);
+		if (ret) {
+			ret = -EFAULT;
+			goto err;
+		}
+
+		printk("Aux succeed with asid %d\n",
+			iommu_aux_get_pasid(vp_vdpa->domain,
+			&pdev->dev));
+
+	}
+
+	ret = iova_cache_get();
+	if (ret)
+		goto err;
+
+	init_iova_domain(&vp_vdpa->iova, PAGE_SIZE, 0);
+
 	ret = vdpa_register_device(&vp_vdpa->vdpa, vp_vdpa->queues);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to register to vdpa bus\n");
@@ -533,9 +726,14 @@ err:
 static void vp_vdpa_remove(struct pci_dev *pdev)
 {
 	struct vp_vdpa *vp_vdpa = pci_get_drvdata(pdev);
+	struct virtio_pci_modern_device *mdev = &vp_vdpa->mdev;
 
+	if (mdev->pasid) {
+		iommu_aux_detach_device(vp_vdpa->domain, &pdev->dev);
+	}
 	vdpa_unregister_device(&vp_vdpa->vdpa);
 	vp_modern_remove(&vp_vdpa->mdev);
+	iova_cache_put();
 }
 
 static struct pci_driver vp_vdpa_driver = {
