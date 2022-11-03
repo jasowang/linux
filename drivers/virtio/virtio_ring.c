@@ -487,29 +487,27 @@ static struct vring_desc *alloc_indirect_split(struct virtqueue *_vq,
 
 static inline unsigned int virtqueue_add_desc_split(struct virtqueue *vq,
 						    struct vring_desc *desc,
-						    unsigned int i,
+						    struct vring_desc_extra *extra,
 						    dma_addr_t addr,
 						    unsigned int len,
 						    u16 flags,
 						    bool indirect)
 {
-	struct vring_virtqueue *vring = to_vvq(vq);
-	struct vring_desc_extra *extra = vring->split.desc_extra;
 	u16 next;
 
-	desc[i].flags = cpu_to_virtio16(vq->vdev, flags);
-	desc[i].addr = cpu_to_virtio64(vq->vdev, addr);
-	desc[i].len = cpu_to_virtio32(vq->vdev, len);
+	desc->flags = cpu_to_virtio16(vq->vdev, flags);
+	desc->addr = cpu_to_virtio64(vq->vdev, addr);
+	desc->len = cpu_to_virtio32(vq->vdev, len);
 
 	if (!indirect) {
-		next = extra[i].next;
-		desc[i].next = cpu_to_virtio16(vq->vdev, next);
+		next = extra->next;
+		desc->next = cpu_to_virtio16(vq->vdev, next);
 
-		extra[i].addr = addr;
-		extra[i].len = len;
-		extra[i].flags = flags;
+		extra->addr = addr;
+		extra->len = len;
+		extra->flags = flags;
 	} else
-		next = virtio16_to_cpu(vq->vdev, desc[i].next);
+		next = virtio16_to_cpu(vq->vdev, desc->next);
 
 	return next;
 }
@@ -525,6 +523,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 {
 	struct vring_virtqueue *vq = to_vvq(_vq);
 	struct scatterlist *sg;
+	struct vring_desc_extra *extra = vq->split.desc_extra;
 	struct vring_desc *desc;
 	unsigned int i, n, avail, descs_used, prev, err_idx;
 	int head;
@@ -590,7 +589,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 			/* Note that we trust indirect descriptor
 			 * table since it use stream DMA mapping.
 			 */
-			i = virtqueue_add_desc_split(_vq, desc, i, addr, sg->length,
+			i = virtqueue_add_desc_split(_vq, &desc[i], &extra[i],
+						     addr, sg->length,
 						     VRING_DESC_F_NEXT,
 						     indirect);
 		}
@@ -605,8 +605,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 			/* Note that we trust indirect descriptor
 			 * table since it use stream DMA mapping.
 			 */
-			i = virtqueue_add_desc_split(_vq, desc, i, addr,
-						     sg->length,
+			i = virtqueue_add_desc_split(_vq, &desc[i], &extra[i],
+						     addr, sg->length,
 						     VRING_DESC_F_NEXT |
 						     VRING_DESC_F_WRITE,
 						     indirect);
@@ -626,8 +626,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 		if (vring_mapping_error(vq, addr))
 			goto unmap_release;
 
-		virtqueue_add_desc_split(_vq, vq->split.vring.desc,
-					 head, addr,
+		virtqueue_add_desc_split(_vq, &vq->split.vring.desc[head],
+					 &extra[head], addr,
 					 total_sg * sizeof(struct vring_desc),
 					 VRING_DESC_F_INDIRECT,
 					 false);
