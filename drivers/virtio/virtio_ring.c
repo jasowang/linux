@@ -13,6 +13,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/kmsan.h>
 #include <linux/spinlock.h>
+#include <linux/ptr_ring.h>
 #include <xen/xen.h>
 
 #ifdef DEBUG
@@ -102,6 +103,7 @@ struct vring_virtqueue_split {
 	/* Per-descriptor state. */
 	struct vring_desc_state_split *desc_state;
 	struct vring_desc_extra *desc_extra;
+	struct ptr_ring *free_ring;
 
 	/* DMA address and size information */
 	dma_addr_t queue_dma_addr;
@@ -480,8 +482,11 @@ static struct vring_desc *alloc_indirect_split(struct virtqueue *_vq,
 	if (!desc)
 		return NULL;
 
-	for (i = 0; i < total_sg; i++)
+	for (i = 0; i < total_sg; i++) {
 		desc[i].next = cpu_to_virtio16(_vq->vdev, i + 1);
+		printk("setup desc %llx desc[%d].next is %d\n",
+			&desc[i], i, desc[i].next);
+	}
 	return desc;
 }
 
@@ -493,6 +498,7 @@ static inline unsigned int virtqueue_add_desc_split(struct virtqueue *vq,
 						    u16 flags,
 						    bool indirect)
 {
+	struct vring_virtqueue *vvq = to_vvq(vq);
 	u16 next;
 
 	desc->flags = cpu_to_virtio16(vq->vdev, flags);
@@ -500,14 +506,21 @@ static inline unsigned int virtqueue_add_desc_split(struct virtqueue *vq,
 	desc->len = cpu_to_virtio32(vq->vdev, len);
 
 	if (!indirect) {
-		next = extra->next;
+		struct vring_virtqueue *vvq = to_vvq(vq);
+		next = (struct vring_desc_extra	*)__ptr_ring_peek(vvq->split.free_ring) -
+			vvq->split.desc_extra;;
+		printk("next is %d\n", next);
 		desc->next = cpu_to_virtio16(vq->vdev, next);
 
+		extra->next = next;
 		extra->addr = addr;
 		extra->len = len;
 		extra->flags = flags;
-	} else
+		printk("extra is %llx\n", extra);
+	} else {
 		next = virtio16_to_cpu(vq->vdev, desc->next);
+		printk("next is %d\n", next);
+	}
 
 	return next;
 }
@@ -523,12 +536,13 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 {
 	struct vring_virtqueue *vq = to_vvq(_vq);
 	struct scatterlist *sg;
-	struct vring_desc_extra *extra = vq->split.desc_extra;
+	struct vring_desc_extra *e, *extra = vq->split.desc_extra;
 	struct vring_desc *desc;
 	unsigned int i, n, avail, descs_used, prev, err_idx;
 	int head;
 	bool indirect;
 
+	printk("start add!\n");
 	START_USE(vq);
 
 	BUG_ON(data == NULL);
@@ -543,7 +557,15 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 
 	BUG_ON(total_sg == 0);
 
-	head = vq->free_head;
+	e = __ptr_ring_peek(vq->split.free_ring);
+	if (!e) {
+		printk("head is NULL!\n");
+		printk("end add!\n");
+		END_USE(vq);
+		return -ENOSPC;
+	}
+
+	head = e - extra;
 
 	if (virtqueue_use_indirect(vq, total_sg))
 		desc = alloc_indirect_split(_vq, total_sg, gfp);
@@ -551,6 +573,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 		desc = NULL;
 		WARN_ON_ONCE(total_sg > vq->split.vring.num && !vq->indirect);
 	}
+
+	printk("---->adding !\n");
 
 	if (desc) {
 		/* Use a single buffer which doesn't continue */
@@ -560,11 +584,12 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 		descs_used = 1;
 	} else {
 		indirect = false;
-		desc = vq->split.vring.desc;
 		i = head;
+		desc = vq->split.vring.desc;
 		descs_used = total_sg;
 	}
 
+	printk("vq %llx num_free before %d\n", vq, vq->vq.num_free);
 	if (unlikely(vq->vq.num_free < descs_used)) {
 		pr_debug("Can't add buf len %i - avail = %i\n",
 			 descs_used, vq->vq.num_free);
@@ -576,6 +601,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 		if (indirect)
 			kfree(desc);
 		END_USE(vq);
+		printk("no space!\n");
+		printk("<----end add!\n");
 		return -ENOSPC;
 	}
 
@@ -584,7 +611,20 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 			dma_addr_t addr = vring_map_one_sg(vq, sg, DMA_TO_DEVICE);
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
-
+			if (!indirect) {
+				e = __ptr_ring_consume(vq->split.free_ring);
+				if (e == NULL) {
+					printk("NULL for ptr_ring 1 %llx\n", vq->split.free_ring);
+					printk("<----End add!\n");
+					END_USE(vq);
+					return -ENOSPC;
+				}
+				printk("ptr_ring %llx consume for in %d\n",
+					vq->split.free_ring, e - extra);
+			} else {
+				printk("Adding indirect in desc[%d]\n", i);
+				printk("desc %llx desc[%d].next is %d\n", &desc[i], i, desc[i].next);
+			}
 			prev = i;
 			/* Note that we trust indirect descriptor
 			 * table since it use stream DMA mapping.
@@ -600,6 +640,18 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 			dma_addr_t addr = vring_map_one_sg(vq, sg, DMA_FROM_DEVICE);
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
+			if (!indirect) {
+				e = __ptr_ring_consume(vq->split.free_ring);
+				if (e == NULL) {
+					printk("NULL for ptr_ring %llx\n", vq->split.free_ring);
+					printk("<----End add!\n");
+					END_USE(vq);
+					return -ENOSPC;
+				}
+				printk("ptr_ring %llx consume for out %d\n",
+					vq->split.free_ring, e - extra);
+			} else
+				printk("Adding indirect out desc[%d]\n", i);
 
 			prev = i;
 			/* Note that we trust indirect descriptor
@@ -613,6 +665,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 		}
 	}
 	/* Last one doesn't continue. */
+	printk("%d doesn't continue\n", prev);
 	desc[prev].flags &= cpu_to_virtio16(_vq->vdev, ~VRING_DESC_F_NEXT);
 	if (!indirect && vq->use_dma_api)
 		vq->split.desc_extra[prev & (vq->split.vring.num - 1)].flags &=
@@ -626,6 +679,16 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 		if (vring_mapping_error(vq, addr))
 			goto unmap_release;
 
+		e = __ptr_ring_consume(vq->split.free_ring);
+		if (e == NULL) {
+			printk("NULL for ptr_ring 3 %llx\n", vq->split.free_ring);
+			printk("<----End add!\n");
+			END_USE(vq);
+			return -ENOSPC;
+		}
+		printk("ptr_ring %llx consume for indirect %d\n",
+			vq->split.free_ring, e - extra);
+
 		virtqueue_add_desc_split(_vq, &vq->split.vring.desc[head],
 					 &extra[head], addr,
 					 total_sg * sizeof(struct vring_desc),
@@ -635,12 +698,15 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 
 	/* We're using some buffers from the free list. */
 	vq->vq.num_free -= descs_used;
+	printk("vq %llx num_free %d\n", vq, vq->vq.num_free);
 
+#if 0
 	/* Update free pointer */
 	if (indirect)
 		vq->free_head = vq->split.desc_extra[head].next;
 	else
 		vq->free_head = i;
+#endif
 
 	/* Store token and indirect buffer state. */
 	vq->split.desc_state[head].data = data;
@@ -669,6 +735,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 	 * just in case. */
 	if (unlikely(vq->num_added == (1 << 16) - 1))
 		virtqueue_kick(_vq);
+
+	printk("<----Adding done!!\n");
 
 	return 0;
 
@@ -731,9 +799,11 @@ static bool virtqueue_kick_prepare_split(struct virtqueue *_vq)
 static void detach_buf_split(struct vring_virtqueue *vq, unsigned int head,
 			     void **ctx)
 {
+	struct vring_desc_extra *extra = vq->split.desc_extra;
 	unsigned int i, j;
 	__virtio16 nextflag = cpu_to_virtio16(vq->vq.vdev, VRING_DESC_F_NEXT);
 
+	printk("---->Start detach!\n");
 	/* Clear data ptr. */
 	vq->split.desc_state[head].data = NULL;
 
@@ -742,16 +812,25 @@ static void detach_buf_split(struct vring_virtqueue *vq, unsigned int head,
 
 	while (vq->split.vring.desc[i].flags & nextflag) {
 		vring_unmap_one_split(vq, i);
+		__ptr_ring_produce(vq->split.free_ring, &extra[i]);
+		printk("ptr_ring %llx produce detach %d\n", vq->split.free_ring, i);
 		i = vq->split.desc_extra[i].next;
 		vq->vq.num_free++;
+		printk("vq %llx num_free after produce %d\n", vq, vq->vq.num_free);
 	}
+	printk("<----End detach!\n");
 
 	vring_unmap_one_split(vq, i);
+	__ptr_ring_produce(vq->split.free_ring, &extra[i]);
+	printk("ptr_ring %llx produce detach %d\n", vq->split.free_ring, i);
+#if 0
 	vq->split.desc_extra[i].next = vq->free_head;
 	vq->free_head = head;
+#endif
 
 	/* Plus final descriptor */
 	vq->vq.num_free++;
+	printk("vq %llx num_free after produce %d\n", vq, vq->vq.num_free);
 
 	if (vq->indirect) {
 		struct vring_desc *indir_desc =
@@ -1009,11 +1088,24 @@ static int vring_alloc_state_extra_split(struct vring_virtqueue_split *vring_spl
 {
 	struct vring_desc_state_split *state;
 	struct vring_desc_extra *extra;
+	struct ptr_ring *free_ring;
 	u32 num = vring_split->vring.num;
+	int i = 0;
+	int err;
+
+	printk("alloc for %llx \n", vring_split);
+
+	free_ring = kmalloc(sizeof(*free_ring), GFP_KERNEL);
+	if (!free_ring)
+		goto err_out;
+
+	err = ptr_ring_init(free_ring, num, GFP_KERNEL);
+	if (err)
+		goto err_init;
 
 	state = kmalloc_array(num, sizeof(struct vring_desc_state_split), GFP_KERNEL);
 	if (!state)
-		goto err_state;
+		goto err_produce;
 
 	extra = vring_alloc_desc_extra(num);
 	if (!extra)
@@ -1021,13 +1113,26 @@ static int vring_alloc_state_extra_split(struct vring_virtqueue_split *vring_spl
 
 	memset(state, 0, num * sizeof(struct vring_desc_state_split));
 
+	for (i = 0; i < num; i++) {
+		if (__ptr_ring_produce(free_ring, &extra[i]))
+			goto err_produce;
+		printk("ptr_ring %llx produce alloc %d\n", free_ring, i);
+	}
+
+	printk("alloc for %llx done \n", vring_split);
+
 	vring_split->desc_state = state;
 	vring_split->desc_extra = extra;
+	vring_split->free_ring = free_ring;
 	return 0;
 
 err_extra:
 	kfree(state);
-err_state:
+err_produce:
+	ptr_ring_cleanup(vring_split->free_ring, NULL);
+err_init:
+	kfree(free_ring);
+err_out:
 	return -ENOMEM;
 }
 
@@ -1038,8 +1143,11 @@ static void vring_free_split(struct vring_virtqueue_split *vring_split,
 			 vring_split->vring.desc,
 			 vring_split->queue_dma_addr);
 
+	ptr_ring_cleanup(vring_split->free_ring, NULL);
+
 	kfree(vring_split->desc_state);
 	kfree(vring_split->desc_extra);
+	kfree(vring_split->free_ring);
 }
 
 static int vring_alloc_queue_split(struct vring_virtqueue_split *vring_split,
@@ -1111,6 +1219,7 @@ static struct virtqueue *vring_create_virtqueue_split(
 	if (err)
 		return NULL;
 
+	printk("vring_create!\n");
 	vq = __vring_new_virtqueue(index, &vring_split, vdev, weak_barriers,
 				   context, notify, callback, name);
 	if (!vq) {
@@ -1136,6 +1245,7 @@ static int virtqueue_resize_split(struct virtqueue *_vq, u32 num)
 	if (err)
 		goto err;
 
+	printk("extra allocation during resize %llx!\n", &vring_split);
 	err = vring_alloc_state_extra_split(&vring_split);
 	if (err)
 		goto err_state_extra;
@@ -2516,6 +2626,7 @@ static struct virtqueue *__vring_new_virtqueue(unsigned int index,
 	if (virtio_has_feature(vdev, VIRTIO_F_ORDER_PLATFORM))
 		vq->weak_barriers = false;
 
+	printk("allocate during new %llx\n", vring_split);
 	err = vring_alloc_state_extra_split(vring_split);
 	if (err) {
 		kfree(vq);
@@ -2644,6 +2755,7 @@ struct virtqueue *vring_new_virtqueue(unsigned int index,
 		return NULL;
 
 	vring_init(&vring_split.vring, num, pages, vring_align);
+	printk("vring_new_virtqueue!\n");
 	return __vring_new_virtqueue(index, &vring_split, vdev, weak_barriers,
 				     context, notify, callback, name);
 }
