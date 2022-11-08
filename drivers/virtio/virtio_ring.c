@@ -769,7 +769,7 @@ static void detach_buf_split(struct vring_virtqueue *vq, unsigned int head,
 			     void **ctx)
 {
 	struct vring_desc_extra *extra = vq->split.desc_extra;
-	unsigned int i, j;
+	unsigned int i, j = 0;
 	__virtio16 nextflag = cpu_to_virtio16(vq->vq.vdev, VRING_DESC_F_NEXT);
 
 	/* Clear data ptr. */
@@ -782,18 +782,20 @@ static void detach_buf_split(struct vring_virtqueue *vq, unsigned int head,
 		vring_unmap_one_split(vq, i);
 		__ptr_ring_produce(vq->split.free_ring, &extra[i]);
 		i = vq->split.desc_extra[i].next;
-		vq->vq.num_free++;
+		j++;
 	}
 
 	vring_unmap_one_split(vq, i);
 	__ptr_ring_produce(vq->split.free_ring, &extra[i]);
+	j++;
 #if 0
 	vq->split.desc_extra[i].next = vq->free_head;
 	vq->free_head = head;
 #endif
 
+	smp_wmb();
 	/* Plus final descriptor */
-	vq->vq.num_free++;
+	vq->vq.num_free += j;
 
 	if (vq->indirect) {
 		struct vring_desc *indir_desc =
