@@ -15,6 +15,7 @@
 #include <linux/blk-mq.h>
 #include <linux/blk-mq-virtio.h>
 #include <linux/numa.h>
+#include <linux/irqflags.h>
 #include <uapi/linux/virtio_ring.h>
 
 #define PART_BITS 4
@@ -281,7 +282,7 @@ static void virtblk_done(struct virtqueue *vq)
 	unsigned long flags;
 	unsigned int len;
 
-	spin_lock_irqsave(&vblk->vqs[qid].lock, flags);
+	local_irq_save(flags);
 	do {
 		virtqueue_disable_cb(vq);
 		while ((vbr = virtqueue_get_buf(vblk->vqs[qid].vq, &len)) != NULL) {
@@ -298,7 +299,7 @@ static void virtblk_done(struct virtqueue *vq)
 	/* In case queue is stopped waiting for more buffers. */
 	if (req_done)
 		blk_mq_start_stopped_hw_queues(vblk->disk->queue, true);
-	spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
+	local_irq_restore(flags);
 }
 
 static void virtio_commit_rqs(struct blk_mq_hw_ctx *hctx)
@@ -353,7 +354,7 @@ static blk_status_t virtio_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (unlikely(status))
 		return status;
 
-	spin_lock_irqsave(&vblk->vqs[qid].lock, flags);
+	local_irq_save(flags);
 	err = virtblk_add_req(vblk->vqs[qid].vq, vbr);
 	if (err) {
 		virtqueue_kick(vblk->vqs[qid].vq);
@@ -362,7 +363,7 @@ static blk_status_t virtio_queue_rq(struct blk_mq_hw_ctx *hctx,
 		 */
 		if (err == -ENOSPC)
 			blk_mq_stop_hw_queue(hctx);
-		spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
+		local_irq_restore(flags);
 		virtblk_unmap_data(req, vbr);
 		virtblk_cleanup_cmd(req);
 		switch (err) {
@@ -377,7 +378,7 @@ static blk_status_t virtio_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	if (bd->last && virtqueue_kick_prepare(vblk->vqs[qid].vq))
 		notify = true;
-	spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
+	local_irq_restore(flags);
 
 	if (notify)
 		virtqueue_notify(vblk->vqs[qid].vq);
